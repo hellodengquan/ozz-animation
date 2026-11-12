@@ -32,8 +32,6 @@
 #error "This header is private, it cannot be included from public headers."
 #endif  // OZZ_INCLUDE_PRIVATE_HEADER
 
-#include <cassert>
-
 #include "ozz/base/containers/stack.h"
 #include "ozz/base/containers/vector.h"
 
@@ -81,11 +79,21 @@ _Track Decimate(const _Track& _src, const _Adapter& _adapter,
       typename _Track::const_reference left = _src[segment.first];
       typename _Track::const_reference right = _src[segment.second];
       for (size_t i = segment.first + 1; i < segment.second; ++i) {
-        assert(!included[i] &&
-               "Included points should be processed once only.");
+        if (included[i]) {
+          continue;
+        }
         typename _Track::const_reference test = _src[i];
         if (!_adapter.Decimable(test)) {
           candidate = i;
+          // A non-decimable key must remain visible. The key immediately
+          // after it is needed to close the interval controlled by that key,
+          // even when all following samples can be reconstructed linearly.
+          if (i + 1 < segment.second) {
+            included[i + 1] = true;
+            if (i + 1 < segment.second - 1) {
+              segments.push(Segment(i + 1, segment.second));
+            }
+          }
           break;
         } else {
           const float distance = _adapter.Distance(

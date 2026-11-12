@@ -29,7 +29,12 @@
 #include "ozz/animation/offline/raw_track.h"
 #include "ozz/animation/offline/track_builder.h"
 #include "ozz/animation/offline/track_optimizer.h"
+#include "ozz/animation/runtime/track.h"
+#include "ozz/animation/runtime/track_sampling_job.h"
+#include "ozz/base/io/archive.h"
+#include "ozz/base/io/stream.h"
 #include "ozz/base/maths/gtest_math_helper.h"
+#include "ozz/base/memory/unique_ptr.h"
 
 using ozz::animation::offline::RawFloat2Track;
 using ozz::animation::offline::RawFloat3Track;
@@ -38,6 +43,215 @@ using ozz::animation::offline::RawFloatTrack;
 using ozz::animation::offline::RawQuaternionTrack;
 using ozz::animation::offline::RawTrackInterpolation;
 using ozz::animation::offline::TrackOptimizer;
+
+namespace {
+
+template <typename _RawTrack>
+struct OptimizedTrackTraits;
+
+#define OZZ_DEFINE_TRACK_TRAITS(_raw, _runtime, _job, _identity)          \
+  template <>                                                             \
+  struct OptimizedTrackTraits<ozz::animation::offline::_raw> {           \
+    typedef ozz::animation::_runtime RuntimeTrack;                       \
+    typedef ozz::animation::_job SamplingJobType;                        \
+    static ozz::animation::offline::_raw::ValueType Identity() {         \
+      return _identity;                                                   \
+    }                                                                     \
+  }
+
+OZZ_DEFINE_TRACK_TRAITS(RawFloatTrack, FloatTrack, FloatTrackSamplingJob,
+                        0.f);
+OZZ_DEFINE_TRACK_TRAITS(RawFloat2Track, Float2Track, Float2TrackSamplingJob,
+                        ozz::math::Float2(0.f, 0.f));
+OZZ_DEFINE_TRACK_TRAITS(RawFloat3Track, Float3Track, Float3TrackSamplingJob,
+                        ozz::math::Float3(0.f, 0.f, 0.f));
+OZZ_DEFINE_TRACK_TRAITS(RawFloat4Track, Float4Track, Float4TrackSamplingJob,
+                        ozz::math::Float4(0.f, 0.f, 0.f, 0.f));
+OZZ_DEFINE_TRACK_TRAITS(
+    RawQuaternionTrack, QuaternionTrack, QuaternionTrackSamplingJob,
+    ozz::math::Quaternion(0.f, 0.f, 0.f, 1.f));
+
+#undef OZZ_DEFINE_TRACK_TRAITS
+
+void ExpectTrackValueEqual(float _expected, float _actual) {
+  EXPECT_FLOAT_EQ(_expected, _actual);
+}
+
+void ExpectTrackValueEqual(const ozz::math::Float2& _expected,
+                           const ozz::math::Float2& _actual) {
+  EXPECT_FLOAT2_EQ(_actual, _expected.x, _expected.y);
+}
+
+void ExpectTrackValueEqual(const ozz::math::Float3& _expected,
+                           const ozz::math::Float3& _actual) {
+  EXPECT_FLOAT3_EQ(_actual, _expected.x, _expected.y, _expected.z);
+}
+
+void ExpectTrackValueEqual(const ozz::math::Float4& _expected,
+                           const ozz::math::Float4& _actual) {
+  EXPECT_FLOAT4_EQ(_actual, _expected.x, _expected.y, _expected.z,
+                   _expected.w);
+}
+
+void ExpectTrackValueEqual(const ozz::math::Quaternion& _expected,
+                           const ozz::math::Quaternion& _actual) {
+  // Quaternions q and -q represent the same rotation. Built tracks normally
+  // share a hemisphere anyway; this keeps the check focused on rotation.
+  const float dot = _expected.x * _actual.x + _expected.y * _actual.y +
+                    _expected.z * _actual.z + _expected.w * _actual.w;
+  if (dot < 0.f) {
+    EXPECT_QUATERNION_EQ(_actual, -_expected.x, -_expected.y, -_expected.z,
+                         -_expected.w);
+  } else {
+    EXPECT_QUATERNION_EQ(_actual, _expected.x, _expected.y, _expected.z,
+                         _expected.w);
+  }
+}
+
+template <typename _RuntimeTrack, typename _SamplingJob, typename _ValueType>
+_ValueType SampleTrack(const _RuntimeTrack& _track, float _ratio) {
+  _SamplingJob job;
+  _ValueType result = _ValueType();
+  job.track = &_track;
+  job.ratio = _ratio;
+  job.result = &result;
+  EXPECT_TRUE(job.Run());
+  return result;
+}
+
+template <typename _RuntimeTrack>
+ozz::unique_ptr<_RuntimeTrack> RoundTripTrack(const _RuntimeTrack& _track) {
+  ozz::io::MemoryStream stream;
+  {
+    ozz::io::OArchive archive(&stream);
+    archive << _track;
+  }
+
+  stream.Seek(0, ozz::io::Stream::kSet);
+  ozz::io::IArchive archive(&stream);
+  ozz::unique_ptr<_RuntimeTrack> result(ozz::make_unique<_RuntimeTrack>());
+  archive >> *result;
+  return result;
+}
+
+const float kOptimizerSampleRatios[] = {
+    -1e-6f,        0.f,          1e-6f,        0.124999f, 0.125f,
+    0.125001f,     0.249999f,    0.25f,        0.250001f, 0.375f,
+    0.499999f,     0.5f,        0.5000005f,    0.500001f, 0.5000015f,
+    0.500002f,     0.625f,      0.749999f,     0.75f,     0.750001f,
+    0.999999f,     1.f,        1.000001f};
+
+template <typename _RawTrack>
+void ExpectOptimizedSamplesMatch(const _RawTrack& _input,
+                                 const _RawTrack& _optimized) {
+  typedef OptimizedTrackTraits<_RawTrack> Traits;
+  typedef typename Traits::RuntimeTrack RuntimeTrack;
+  typedef typename _RawTrack::ValueType ValueType;
+
+  ozz::animation::offline::TrackBuilder builder;
+  ozz::unique_ptr<RuntimeTrack> original(builder(_input));
+  ozz::unique_ptr<RuntimeTrack> optimized(builder(_optimized));
+  ASSERT_TRUE(original);
+  ASSERT_TRUE(optimized);
+
+  for (size_t i = 0; i < OZZ_ARRAY_SIZE(kOptimizerSampleRatios); ++i) {
+    const float ratio = kOptimizerSampleRatios[i];
+    SCOPED_TRACE(ratio);
+    const ValueType original_value =
+        SampleTrack<RuntimeTrack, typename Traits::SamplingJobType, ValueType>(
+            *original, ratio);
+    const ValueType optimized_value =
+        SampleTrack<RuntimeTrack, typename Traits::SamplingJobType, ValueType>(
+            *optimized, ratio);
+    ExpectTrackValueEqual(original_value, optimized_value);
+  }
+
+  ozz::unique_ptr<RuntimeTrack> archived = RoundTripTrack(*optimized);
+  ASSERT_TRUE(archived);
+  EXPECT_EQ(archived->size(), optimized->size());
+
+  for (size_t i = 0; i < OZZ_ARRAY_SIZE(kOptimizerSampleRatios); ++i) {
+    const float ratio = kOptimizerSampleRatios[i];
+    SCOPED_TRACE(ratio);
+    const ValueType optimized_value =
+        SampleTrack<RuntimeTrack, typename Traits::SamplingJobType, ValueType>(
+            *optimized, ratio);
+    const ValueType archived_value =
+        SampleTrack<RuntimeTrack, typename Traits::SamplingJobType, ValueType>(
+            *archived, ratio);
+    ExpectTrackValueEqual(optimized_value, archived_value);
+  }
+}
+
+template <typename _RawTrack>
+void CheckOptimizationPreservesSampling(const _RawTrack& _input,
+                                        float _tolerance) {
+  TrackOptimizer optimizer;
+  optimizer.tolerance = _tolerance;
+
+  _RawTrack optimized;
+  ASSERT_TRUE(optimizer(_input, &optimized));
+  ExpectOptimizedSamplesMatch(_input, optimized);
+}
+
+template <typename _RawTrack>
+void CheckEmptyTrackKeepsDefaultValue() {
+  typedef OptimizedTrackTraits<_RawTrack> Traits;
+  typedef typename Traits::RuntimeTrack RuntimeTrack;
+  typedef typename _RawTrack::ValueType ValueType;
+
+  _RawTrack input;
+  ASSERT_TRUE(input.Validate());
+
+  TrackOptimizer optimizer;
+  optimizer.tolerance = 1e-9f;
+  _RawTrack optimized;
+  ASSERT_TRUE(optimizer(input, &optimized));
+  EXPECT_TRUE(optimized.keyframes.empty());
+
+  ozz::animation::offline::TrackBuilder builder;
+  ozz::unique_ptr<RuntimeTrack> track(builder(optimized));
+  ASSERT_TRUE(track);
+
+  const ValueType expected = Traits::Identity();
+  for (size_t i = 0; i < OZZ_ARRAY_SIZE(kOptimizerSampleRatios); ++i) {
+    const float ratio = kOptimizerSampleRatios[i];
+    SCOPED_TRACE(ratio);
+    const ValueType value =
+        SampleTrack<RuntimeTrack, typename Traits::SamplingJobType, ValueType>(
+            *track, ratio);
+    ExpectTrackValueEqual(expected, value);
+  }
+
+  ozz::unique_ptr<RuntimeTrack> archived = RoundTripTrack(*track);
+  ASSERT_TRUE(archived);
+  EXPECT_EQ(archived->size(), track->size());
+  const ValueType archived_value =
+      SampleTrack<RuntimeTrack, typename Traits::SamplingJobType, ValueType>(
+          *archived, .5f);
+  ExpectTrackValueEqual(expected, archived_value);
+}
+
+template <typename _RawTrack>
+void CheckInvalidTrackFailureContract(const _RawTrack& _input) {
+  ASSERT_FALSE(_input.Validate());
+
+  _RawTrack output;
+  typedef typename _RawTrack::Keyframe Keyframe;
+  Keyframe retained = {
+      RawTrackInterpolation::kLinear, 0.f,
+      OptimizedTrackTraits<_RawTrack>::Identity()};
+  output.keyframes.push_back(retained);
+
+  TrackOptimizer optimizer;
+  EXPECT_FALSE(optimizer(_input, &output));
+  EXPECT_TRUE(output.keyframes.empty());
+
+  ozz::animation::offline::TrackBuilder builder;
+  EXPECT_TRUE(builder(_input) == nullptr);
+}
+
+}  // namespace
 
 TEST(Error, TrackOptimizer) {
   TrackOptimizer optimizer;
@@ -465,4 +679,255 @@ TEST(Quaternion, TrackOptimizer) {
   EXPECT_FLOAT_EQ(output.keyframes[1].ratio, key2.ratio);
   EXPECT_QUATERNION_EQ(output.keyframes[1].value, key2.value.x, key2.value.y,
                        key2.value.z, key2.value.w);
+}
+
+template <typename _ValueType>
+_ValueType MakeTrackTestValue(float _value);
+
+template <>
+float MakeTrackTestValue<float>(float _value) {
+  return _value;
+}
+
+template <>
+ozz::math::Float2 MakeTrackTestValue<ozz::math::Float2>(float _value) {
+  return ozz::math::Float2(_value, 100.f - _value);
+}
+
+template <>
+ozz::math::Float3 MakeTrackTestValue<ozz::math::Float3>(float _value) {
+  return ozz::math::Float3(_value, 100.f - _value, 2.f * _value);
+}
+
+template <>
+ozz::math::Float4 MakeTrackTestValue<ozz::math::Float4>(float _value) {
+  return ozz::math::Float4(_value, 100.f - _value, 2.f * _value,
+                           20.f - _value);
+}
+
+template <>
+ozz::math::Quaternion
+MakeTrackTestValue<ozz::math::Quaternion>(float _value) {
+  const float angle = _value * .01f * ozz::math::kPi;
+  return ozz::math::Quaternion::FromAxisAngle(
+      ozz::math::Float3(0.f, 0.f, 1.f), angle);
+}
+
+template <typename _RawTrack>
+void AddTrackTestKey(_RawTrack* _track,
+                     RawTrackInterpolation::Value _interpolation, float _ratio,
+                     float _value) {
+  typename _RawTrack::Keyframe key = {
+      _interpolation, _ratio,
+      MakeTrackTestValue<typename _RawTrack::ValueType>(_value)};
+  _track->keyframes.push_back(key);
+}
+
+template <typename _RawTrack>
+void CheckLinearOptimizationAcrossTrack() {
+  const float ratios[] = {0.f,     .125f,      .25f, .5f,
+                          .500001f, .75f,      1.f};
+  const float values[] = {0.f, 2.5f, 5.f, 9.f, 11.f, 15.f, 20.f};
+
+  _RawTrack input;
+  for (size_t i = 0; i < OZZ_ARRAY_SIZE(ratios); ++i) {
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, ratios[i],
+                    values[i]);
+  }
+
+  TrackOptimizer optimizer;
+  _RawTrack optimized;
+  ASSERT_TRUE(optimizer(input, &optimized));
+  EXPECT_LT(optimized.keyframes.size(), input.keyframes.size());
+
+  ExpectOptimizedSamplesMatch(input, optimized);
+}
+
+TEST(LinearSamplingEquivalence, TrackOptimizer) {
+  CheckLinearOptimizationAcrossTrack<RawFloatTrack>();
+  CheckLinearOptimizationAcrossTrack<RawFloat2Track>();
+  CheckLinearOptimizationAcrossTrack<RawFloat3Track>();
+  CheckLinearOptimizationAcrossTrack<RawFloat4Track>();
+  CheckLinearOptimizationAcrossTrack<RawQuaternionTrack>();
+}
+
+template <typename _RawTrack>
+void CheckStepOptimizationAcrossTrack() {
+  const float ratios[] = {0.f, .25f, .5f, .75f, 1.f};
+  const float values[] = {0.f, 20.f, 40.f, 60.f, 80.f};
+  const RawTrackInterpolation::Value interpolations[] = {
+      RawTrackInterpolation::kLinear, RawTrackInterpolation::kStep,
+      RawTrackInterpolation::kLinear, RawTrackInterpolation::kLinear,
+      RawTrackInterpolation::kLinear};
+
+  _RawTrack input;
+  for (size_t i = 0; i < OZZ_ARRAY_SIZE(ratios); ++i) {
+    AddTrackTestKey(&input, interpolations[i], ratios[i], values[i]);
+  }
+
+  TrackOptimizer optimizer;
+  _RawTrack optimized;
+  ASSERT_TRUE(optimizer(input, &optimized));
+
+  size_t step_key = 0;
+  size_t next_linear_key = 0;
+  for (size_t i = 0; i < optimized.keyframes.size(); ++i) {
+    if (optimized.keyframes[i].ratio == .25f) {
+      step_key = i;
+    }
+    if (optimized.keyframes[i].ratio == .5f) {
+      next_linear_key = i;
+    }
+  }
+  ASSERT_LT(step_key, optimized.keyframes.size());
+  ASSERT_LT(next_linear_key, optimized.keyframes.size());
+  EXPECT_EQ(optimized.keyframes[step_key].interpolation,
+            RawTrackInterpolation::kStep);
+  EXPECT_LT(step_key, next_linear_key);
+
+  ExpectOptimizedSamplesMatch(input, optimized);
+}
+
+TEST(StepSamplingEquivalence, TrackOptimizer) {
+  CheckStepOptimizationAcrossTrack<RawFloatTrack>();
+  CheckStepOptimizationAcrossTrack<RawFloat2Track>();
+  CheckStepOptimizationAcrossTrack<RawFloat3Track>();
+  CheckStepOptimizationAcrossTrack<RawFloat4Track>();
+  CheckStepOptimizationAcrossTrack<RawQuaternionTrack>();
+}
+
+TEST(QuaternionShortestPathSurvivesOptimization, TrackOptimizer) {
+  const ozz::math::Quaternion qx(
+      .70710677f, 0.f, 0.f, .70710677f);  // 90 degrees around x.
+  const ozz::math::Quaternion qy(
+      0.f, .70710677f, 0.f, .70710677f);  // 90 degrees around y.
+
+  RawQuaternionTrack input;
+  const RawQuaternionTrack::Keyframe key0 = {
+      RawTrackInterpolation::kLinear, 0.f, qx};
+  input.keyframes.push_back(key0);
+  const RawQuaternionTrack::Keyframe key1 = {
+      RawTrackInterpolation::kLinear, .5f, -qx};
+  input.keyframes.push_back(key1);
+  const RawQuaternionTrack::Keyframe key2 = {
+      RawTrackInterpolation::kLinear, .500001f, qx};
+  input.keyframes.push_back(key2);
+  const RawQuaternionTrack::Keyframe key3 = {
+      RawTrackInterpolation::kLinear, 1.f, qy};
+  input.keyframes.push_back(key3);
+
+  TrackOptimizer optimizer;
+  optimizer.tolerance = 1e-9f;
+  RawQuaternionTrack optimized;
+  ASSERT_TRUE(optimizer(input, &optimized));
+  ExpectOptimizedSamplesMatch(input, optimized);
+
+  ozz::animation::offline::TrackBuilder builder;
+  ozz::unique_ptr<ozz::animation::QuaternionTrack> track(builder(optimized));
+  ASSERT_TRUE(track);
+  ozz::unique_ptr<ozz::animation::QuaternionTrack> original_track(
+      builder(input));
+  ASSERT_TRUE(original_track);
+
+  // The builder puts qx and -qx on the same hemisphere. NLerp therefore keeps
+  // this pair on the builder's shortest-path interpolation branch.
+  const ozz::math::Quaternion before_step =
+      SampleTrack<ozz::animation::QuaternionTrack,
+                  ozz::animation::QuaternionTrackSamplingJob,
+                  ozz::math::Quaternion>(*track, .499999f);
+  ExpectTrackValueEqual(qx, before_step);
+
+  const ozz::math::Quaternion at_close_pair =
+      SampleTrack<ozz::animation::QuaternionTrack,
+                  ozz::animation::QuaternionTrackSamplingJob,
+                  ozz::math::Quaternion>(*track, .500001f);
+  ExpectTrackValueEqual(qx, at_close_pair);
+
+  const ozz::math::Quaternion after_close_pair =
+      SampleTrack<ozz::animation::QuaternionTrack,
+                  ozz::animation::QuaternionTrackSamplingJob,
+                  ozz::math::Quaternion>(*track, .75f);
+  const ozz::math::Quaternion original_after_close_pair =
+      SampleTrack<ozz::animation::QuaternionTrack,
+                  ozz::animation::QuaternionTrackSamplingJob,
+                  ozz::math::Quaternion>(*original_track, .75f);
+  ExpectTrackValueEqual(original_after_close_pair, after_close_pair);
+}
+
+TEST(InvalidRatiosKeepFailureContract, TrackOptimizer) {
+  {
+    RawFloatTrack input;
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, .2f, 1.f);
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, .1f, 2.f);
+    CheckInvalidTrackFailureContract(input);
+  }
+
+  {
+    RawFloatTrack input;
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, .1f, 1.f);
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, .1f, 2.f);
+    CheckInvalidTrackFailureContract(input);
+  }
+
+  {
+    RawFloatTrack input;
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, -.1f, 1.f);
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, .1f, 2.f);
+    CheckInvalidTrackFailureContract(input);
+  }
+
+  {
+    RawFloatTrack input;
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, .9f, 1.f);
+    AddTrackTestKey(&input, RawTrackInterpolation::kLinear, 1.1f, 2.f);
+    CheckInvalidTrackFailureContract(input);
+  }
+}
+
+TEST(EmptyTracksKeepDefaultValues, TrackOptimizer) {
+  CheckEmptyTrackKeepsDefaultValue<RawFloatTrack>();
+  CheckEmptyTrackKeepsDefaultValue<RawFloat2Track>();
+  CheckEmptyTrackKeepsDefaultValue<RawFloat3Track>();
+  CheckEmptyTrackKeepsDefaultValue<RawFloat4Track>();
+  CheckEmptyTrackKeepsDefaultValue<RawQuaternionTrack>();
+}
+
+TEST(MultipleTrackTypesAndMissingTrack, TrackOptimizer) {
+  RawFloatTrack linear_float;
+  AddTrackTestKey(&linear_float, RawTrackInterpolation::kLinear, 0.f, 0.f);
+  AddTrackTestKey(&linear_float, RawTrackInterpolation::kLinear, .25f, 4.f);
+  AddTrackTestKey(&linear_float, RawTrackInterpolation::kLinear, .5f, 9.f);
+  AddTrackTestKey(&linear_float, RawTrackInterpolation::kLinear, 1.f, 20.f);
+
+  RawFloat2Track step_float2;
+  AddTrackTestKey(&step_float2, RawTrackInterpolation::kLinear, 0.f, 0.f);
+  AddTrackTestKey(&step_float2, RawTrackInterpolation::kStep, .25f, 20.f);
+  AddTrackTestKey(&step_float2, RawTrackInterpolation::kLinear, .5f, 40.f);
+  AddTrackTestKey(&step_float2, RawTrackInterpolation::kLinear, 1.f, 80.f);
+
+  RawFloat3Track linear_float3;
+  AddTrackTestKey(&linear_float3, RawTrackInterpolation::kLinear, 0.f, 0.f);
+  AddTrackTestKey(&linear_float3, RawTrackInterpolation::kLinear, .5f, 9.f);
+  AddTrackTestKey(&linear_float3, RawTrackInterpolation::kLinear, 1.f, 20.f);
+
+  RawFloat4Track step_float4;
+  AddTrackTestKey(&step_float4, RawTrackInterpolation::kLinear, 0.f, 0.f);
+  AddTrackTestKey(&step_float4, RawTrackInterpolation::kStep, .25f, 20.f);
+  AddTrackTestKey(&step_float4, RawTrackInterpolation::kLinear, .5f, 40.f);
+  AddTrackTestKey(&step_float4, RawTrackInterpolation::kLinear, 1.f, 80.f);
+
+  RawQuaternionTrack quaternion;
+  AddTrackTestKey(&quaternion, RawTrackInterpolation::kLinear, 0.f, 0.f);
+  AddTrackTestKey(&quaternion, RawTrackInterpolation::kLinear, .5f, 1.f);
+  AddTrackTestKey(&quaternion, RawTrackInterpolation::kLinear, 1.f, 50.f);
+
+  CheckOptimizationPreservesSampling(linear_float, 1e-9f);
+  CheckOptimizationPreservesSampling(step_float2, 1e-9f);
+  CheckOptimizationPreservesSampling(linear_float3, 1e-9f);
+  CheckOptimizationPreservesSampling(step_float4, 1e-9f);
+  CheckOptimizationPreservesSampling(quaternion, 1e-12f);
+
+  // An absent/empty track remains an identity/default source after optimizing,
+  // building and archiving the rest of this track set.
+  CheckEmptyTrackKeepsDefaultValue<RawFloatTrack>();
 }
