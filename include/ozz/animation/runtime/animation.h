@@ -45,6 +45,10 @@ namespace offline {
 class AnimationBuilder;
 }
 
+// Forward declares the sampling job, whose context needs to identify
+// animations.
+struct SamplingJob;
+
 // Forward declaration of key frame's type.
 namespace internal {
 struct Float3Key;
@@ -154,6 +158,14 @@ class OZZ_ANIMATION_DLL Animation {
     return scales_values_;
   }
 
+  // Gets the unique identifier of this animation instance.
+  // A new identifier is assigned every time an animation is built or loaded
+  // (and when it is moved from another one), so it remains unique even if an
+  // animation address is recycled by successive delete/new calls. Sampling
+  // contexts use it to detect that they are being used with another animation
+  // and invalidate their cache before reading it.
+  uint64_t id() const { return id_; }
+
   // Get the estimated animation's size in bytes.
   size_t size() const;
 
@@ -165,6 +177,9 @@ class OZZ_ANIMATION_DLL Animation {
  private:
   // AnimationBuilder class is allowed to instantiate an Animation.
   friend class offline::AnimationBuilder;
+
+  // The sampling context needs to read the animation identifier.
+  friend struct SamplingJob;
 
   // Internal memory management functions.
   struct AllocateParams {
@@ -212,6 +227,9 @@ class OZZ_ANIMATION_DLL Animation {
   span<internal::Float3Key> translations_values_;
   span<internal::QuaternionKey> rotations_values_;
   span<internal::Float3Key> scales_values_;
+
+  // Session unique identifier (not serialized). See id().
+  uint64_t id_ = 0;
 };
 }  // namespace animation
 

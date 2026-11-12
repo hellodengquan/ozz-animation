@@ -58,19 +58,27 @@ OZZ_ANIMOFFLINE_DLL math::Float3 LerpScale(const math::Float3& _a,
 // Samples a RawAnimation track. This function shall be used for offline
 // purpose. Use ozz::animation::Animation and ozz::animation::SamplingJob for
 // runtime purpose.
+// When _loop is false (the default), _time is clamped in the track range and
+// the function exposes the historical clamping behavior. When _loop is true,
+// the track is considered cyclic, matching the runtime SamplingJob loop
+// convention: _time is wrapped in [0,duration[ and an exact duration time
+// samples the first keyframe, so the data generated offline is consistent
+// with a posture sampled while crossing a runtime loop boundary.
 // Returns false if track is invalid.
 OZZ_ANIMOFFLINE_DLL bool SampleTrack(const RawAnimation::JointTrack& _track,
                                      float _time,
-                                     ozz::math::Transform* _transform);
+                                     ozz::math::Transform* _transform,
+                                     bool _loop = false);
 
 // Samples a RawAnimation. This function shall be used for offline
 // purpose. Use ozz::animation::Animation and ozz::animation::SamplingJob for
 // runtime purpose.
 // _animation must be valid.
+// See SampleTrack for the meaning of _loop.
 // Returns false output range is too small or animation is invalid.
 OZZ_ANIMOFFLINE_DLL bool SampleAnimation(
     const RawAnimation& _animation, float _time,
-    const span<ozz::math::Transform>& _transforms);
+    const span<ozz::math::Transform>& _transforms, bool _loop = false);
 
 // Samples a RawAnimation track in model space. This function shall be used for
 // offline purpose. Use ozz::animation::Animation and

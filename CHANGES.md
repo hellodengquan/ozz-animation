@@ -1,3 +1,11 @@
+Next release
+------------
+
+* Library
+  - [animation] Adds cyclic (looping) sampling support to `SamplingJob` through its new `loop` option. When enabled, sampling at the end ratio of a clip exposes its first keyframe posture, so playing across a loop boundary keeps translation, rotation and scale continuous and reproducible. Non-looping sampling, out of bounds ratios and empty outputs keep their previous behavior.
+  - [animation] Identifies animation instances with a session unique identifier so a sampling context cannot read stale keyframes when an animation address is recycled, or when the looping convention is toggled.
+  - [offline] Adds an optional looping mode to `SampleTrack` and `SampleAnimation`, matching the runtime loop boundary convention used by `SamplingJob`.
+
 Release version 0.17.0
 ----------------------
 

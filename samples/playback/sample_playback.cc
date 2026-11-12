@@ -62,6 +62,9 @@ class PlaybackSampleApplication : public ozz::sample::Application {
     sampling_job.animation = &animation_;
     sampling_job.context = &context_;
     sampling_job.ratio = controller_.time_ratio();
+    // Matches the controller playback mode so crossing a loop boundary keeps
+    // a continuous, reproducible posture.
+    sampling_job.loop = controller_.loop();
     sampling_job.output = make_span(locals_);
     if (!sampling_job.Run()) {
       return false;

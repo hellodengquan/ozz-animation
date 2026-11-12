@@ -27,6 +27,7 @@
 
 #include "ozz/animation/runtime/animation.h"
 
+#include <atomic>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -44,6 +45,17 @@
 namespace ozz {
 namespace animation {
 
+namespace {
+// Generates session unique animation identifiers. They are intentionally not
+// serialized: they only disambiguate animation instances within a running
+// process, so sampling contexts can invalidate their cache even when an
+// animation address is recycled.
+uint64_t NextAnimationId() {
+  static std::atomic<uint64_t> next_id{1};
+  return next_id.fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace
+
 Animation::Animation(Animation&& _other) { *this = std::move(_other); }
 
 Animation& Animation::operator=(Animation&& _other) {
@@ -58,6 +70,10 @@ Animation& Animation::operator=(Animation&& _other) {
   std::swap(translations_values_, _other.translations_values_);
   std::swap(rotations_values_, _other.rotations_values_);
   std::swap(scales_values_, _other.scales_values_);
+  // Ids follow the animation data: after the move the context cache must be
+  // valid for the object now owning the keyframes, and never for the moved-from
+  // one.
+  std::swap(id_, _other.id_);
 
   return *this;
 }
@@ -65,6 +81,10 @@ Animation& Animation::operator=(Animation&& _other) {
 Animation::~Animation() { Deallocate(); }
 
 void Animation::Allocate(const AllocateParams& _params) {
+  // Every allocation backs a distinct set of keyframes, hence needs a fresh
+  // identifier. This also covers animations deserialized from an archive.
+  id_ = NextAnimationId();
+
   // Distributes buffer memory while ensuring proper alignment (serves larger
   // alignment values first).
   static_assert(

@@ -28,16 +28,20 @@
 #include "gtest/gtest.h"
 #include "ozz/animation/offline/animation_builder.h"
 #include "ozz/animation/offline/raw_animation.h"
+#include "ozz/animation/offline/raw_animation_utils.h"
 #include "ozz/animation/runtime/animation.h"
 #include "ozz/animation/runtime/sampling_job.h"
 #include "ozz/animation/runtime/skeleton.h"
+#include "ozz/base/maths/transform.h"
 #include "ozz/base/maths/gtest_math_helper.h"
 #include "ozz/base/maths/soa_transform.h"
 #include "ozz/base/memory/unique_ptr.h"
 
 using ozz::animation::Animation;
+using ozz::animation::SamplingJob;
 using ozz::animation::offline::AnimationBuilder;
 using ozz::animation::offline::RawAnimation;
+using ozz::animation::offline::SampleAnimation;
 
 TEST(Error, AnimationBuilder) {
   // Instantiates a builder objects with default parameters.
@@ -487,4 +491,52 @@ TEST(ManyKeys, SamplingJob) {
     EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 20.f, 0.f, -1.f, 3.f, 20.f,
                             0.f, -1.f, 3.f, 20.f, 0.f, -1.f, 3.f);
   }
+}
+
+TEST(LoopBoundaryOfflineRuntimeConsistency, AnimationBuilder) {
+  // Offline raw sampling and runtime sampling of the built animation must
+  // agree on the loop boundary convention.
+  RawAnimation raw_animation;
+  raw_animation.duration = 1.f;
+  raw_animation.tracks.resize(1);
+  raw_animation.tracks[0].translations.push_back(
+      {0.f, ozz::math::Float3(0.f, 0.f, 0.f)});
+  raw_animation.tracks[0].translations.push_back(
+      {1.f, ozz::math::Float3(10.f, 0.f, 0.f)});
+
+  ozz::math::Transform offline[1];
+  ASSERT_TRUE(
+      SampleAnimation(raw_animation, 1.f, ozz::span<ozz::math::Transform>(
+                                            offline, 1),
+                      true));
+
+  AnimationBuilder builder;
+  ozz::unique_ptr<Animation> animation(builder(raw_animation));
+  ASSERT_TRUE(animation);
+
+  SamplingJob::Context context(4);
+  ozz::math::SoaTransform runtime[1];
+  SamplingJob job;
+  job.animation = animation.get();
+  job.context = &context;
+  job.loop = true;
+  job.ratio = 1.f;
+  job.output = runtime;
+  ASSERT_TRUE(job.Run());
+
+  // Both expose the first keyframe translation on the loop boundary frame.
+  EXPECT_FLOAT_EQ(offline[0].translation.x, 0.f);
+  EXPECT_SOAFLOAT3_EQ_EST(runtime[0].translation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+
+  // And both still expose the last keyframe when looping is disabled.
+  ASSERT_TRUE(
+      SampleAnimation(raw_animation, 1.f, ozz::span<ozz::math::Transform>(
+                                            offline, 1),
+                      false));
+  job.loop = false;
+  ASSERT_TRUE(job.Run());
+  EXPECT_FLOAT_EQ(offline[0].translation.x, 10.f);
+  EXPECT_SOAFLOAT3_EQ_EST(runtime[0].translation, 10.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
 }

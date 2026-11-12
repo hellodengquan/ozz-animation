@@ -72,6 +72,22 @@ struct OZZ_ANIMATION_DLL SamplingJob {
   // approximation issue on range bounds.
   float ratio = 0.f;
 
+  // Enables cyclic (looping) sampling.
+  // When set to false (the default), the job keeps its historical clamping
+  // behavior: ratios outside of the [0,1] interval are clamped, hence the
+  // posture sampled at the end of the animation (ratio 1) is the last keyframe
+  // one.
+  // When set to true, the animation is treated as an endless periodic clip:
+  // - a ratio of 1 (which a playback controller produces on the frame that
+  //   crosses the loop boundary) samples the first keyframe posture instead of
+  //   the last one, so that the next frame (a ratio slightly greater than 0)
+  //   continues from the same posture without any discontinuity;
+  // - the same (animation, loop, ratio) triplet always produces the same
+  //   output, whatever the context's previous sampling state.
+  // Ratios outside of the [0,1] interval are still clamped, matching the
+  // non-looping behavior for out of bounds inputs.
+  bool loop = false;
+
   // The animation to sample.
   const Animation* animation = nullptr;
 
@@ -126,11 +142,11 @@ class OZZ_ANIMATION_DLL SamplingJob::Context {
   // Invalidate the context.
   // The SamplingJob automatically invalidates a context when required
   // during sampling. This automatic mechanism is based on the animation
-  // address and sampling time ratio. The weak point is that it can result in a
-  // crash if ever the address of an animation is used again with another
-  // animation (could be the result of successive call to delete / new).
-  // Therefore it is recommended to manually invalidate a context when it is
-  // known that this context will not be used for with an animation again.
+  // unique identifier (see Animation::id), the looping sampling convention
+  // and the sampling time ratio. Using a unique identifier rather than the
+  // animation address keeps the context safe even if an address is recycled
+  // through successive delete / new calls. Manually invalidating a context
+  // remains useful when reusing it after an animation is known to be gone.
   void Invalidate();
 
   // The maximum number of tracks that the context can handle.
@@ -155,8 +171,17 @@ class OZZ_ANIMATION_DLL SamplingJob::Context {
   // Steps the context in order to use it for a potentially new animation. If
   // the _animation is different from the animation currently cached, then the
   // context is invalidated and reset for the new _animation and _ratio.
+  // The _loop flag is tracked as part of the sampling configuration: toggling
+  // it invalidates the cache as well, so a context reused with another
+  // sampling convention cannot read stale keyframes.
   // Return previous ratio.
-  float Step(const Animation& _animation, float _ratio);
+  float Step(const Animation& _animation, float _ratio, bool _loop);
+
+  // Resets every component cache to the first keyframes, without forgetting
+  // which animation the context is bound to. Used when sampling crosses a loop
+  // boundary, so the next update reads the beginning of the animation instead
+  // of keyframes cached for its end.
+  void Restart();
 
   void Deallocate();
 
@@ -166,6 +191,9 @@ class OZZ_ANIMATION_DLL SamplingJob::Context {
 
   // The current time ratio in the animation.
   float ratio_;
+
+  // The sampling convention (looping or not) the cache is currently valid for.
+  bool loop_ = false;
 
   // The number of soa tracks that can store this context.
   int max_soa_tracks_;

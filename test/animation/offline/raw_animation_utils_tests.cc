@@ -321,6 +321,49 @@ TEST(SamplingAnimation, Utils) {
   }
 }
 
+TEST(SamplingAnimationLoop, Utils) {
+  RawAnimation raw_animation;
+  raw_animation.duration = 2.f;
+  raw_animation.tracks.resize(1);
+  raw_animation.tracks[0].translations.push_back(
+      {0.f, ozz::math::Float3(0.f, 0.f, 0.f)});
+  raw_animation.tracks[0].translations.push_back(
+      {2.f, ozz::math::Float3(10.f, 0.f, 0.f)});
+
+  ozz::math::Transform output[1];
+
+  // Default non-looping behavior is unchanged.
+  ASSERT_TRUE(
+      ozz::animation::offline::SampleAnimation(raw_animation, 2.f, output));
+  EXPECT_FLOAT3_EQ(output[0].translation, 10.f, 0.f, 0.f);
+
+  // An exact loop boundary samples the beginning of the next loop, matching
+  // the runtime SamplingJob loop convention.
+  ASSERT_TRUE(ozz::animation::offline::SampleAnimation(
+      raw_animation, 2.f, output, true));
+  EXPECT_FLOAT3_EQ(output[0].translation, 0.f, 0.f, 0.f);
+
+  // Times beyond one period are wrapped and keep the same interpolation
+  // semantics as within the first loop.
+  ASSERT_TRUE(ozz::animation::offline::SampleAnimation(
+      raw_animation, 2.5f, output, true));
+  EXPECT_FLOAT3_EQ(output[0].translation, 2.5f, 0.f, 0.f);
+  ASSERT_TRUE(ozz::animation::offline::SampleAnimation(
+      raw_animation, 4.5f, output, true));
+  EXPECT_FLOAT3_EQ(output[0].translation, 2.5f, 0.f, 0.f);
+
+  // Negative times wrap backward into the previous loop as well.
+  ASSERT_TRUE(ozz::animation::offline::SampleAnimation(
+      raw_animation, -.5f, output, true));
+  EXPECT_FLOAT3_EQ(output[0].translation, 7.5f, 0.f, 0.f);
+
+  // SampleTrack exposes the same convention, using its own keyframe span.
+  ozz::math::Transform track_output;
+  ASSERT_TRUE(ozz::animation::offline::SampleTrack(
+      raw_animation.tracks[0], 2.f, &track_output, true));
+  EXPECT_FLOAT3_EQ(track_output.translation, 0.f, 0.f, 0.f);
+}
+
 TEST(FixedRateSamplingTime, Utils) {
   {  // From 0
     ozz::animation::offline::FixedRateSamplingTime it(1.f, 30.f);

@@ -472,15 +472,33 @@ bool SamplingJob::Run() const {
   const float clamped_ratio = math::Clamp(0.f, ratio, 1.f);
 
   // Step the context to this potentially new animation and ratio.
-  const float previous_ratio = context->Step(*animation, clamped_ratio);
+  const float previous_ratio = context->Step(*animation, clamped_ratio, loop);
+
+  // A looping playback reaches the end of the clip (ratio 1) on the frame it
+  // crosses the loop boundary, before restarting from a ratio slightly greater
+  // than 0. In order to avoid a posture discontinuity on that next frame, the
+  // boundary frame must expose the first keyframe posture (the one that will
+  // be interpolated from when playback restarts). The caches are therefore
+  // reset to the beginning of the animation, which is also the state the
+  // forward cache update expects when playing the next loop.
+  // Out of bounds ratios keep the historical clamping behavior, even in loop
+  // mode, so only an exact end of clip ratio triggers the boundary handling.
+  const bool loop_boundary = loop && clamped_ratio >= 1.f;
+  if (loop_boundary) {
+    context->Restart();
+  }
 
   // Update cache with animation keyframe indexes for t = ratio.
   // Decompresses outdated soa hot values.
+  // When the loop boundary is crossed, caches are restarted from the first
+  // keyframes and updated for ratio 0: this deterministically provides the
+  // first keyframe posture, whatever the context's previous state was.
+  const float cache_ratio = loop_boundary ? 0.f : clamped_ratio;
 
   // Translations
   const Animation::KeyframesCtrlConst& translations_ctrl =
       animation->translations_ctrl();
-  UpdateCache(clamped_ratio, previous_ratio, num_soa_tracks,
+  UpdateCache(cache_ratio, previous_ratio, num_soa_tracks,
               animation->timepoints(), translations_ctrl,
               context->translations_cache_);
   Decompress(num_soa_tracks, animation->timepoints(), translations_ctrl,
@@ -490,7 +508,7 @@ bool SamplingJob::Run() const {
   // Rotations
   const Animation::KeyframesCtrlConst& rotations_ctrl =
       animation->rotations_ctrl();
-  UpdateCache(clamped_ratio, previous_ratio, num_soa_tracks,
+  UpdateCache(cache_ratio, previous_ratio, num_soa_tracks,
               animation->timepoints(), rotations_ctrl,
               context->rotations_cache_);
   Decompress(num_soa_tracks, animation->timepoints(), rotations_ctrl,
@@ -499,7 +517,7 @@ bool SamplingJob::Run() const {
 
   // Scales
   const Animation::KeyframesCtrlConst& scales_ctrl = animation->scales_ctrl();
-  UpdateCache(clamped_ratio, previous_ratio, num_soa_tracks,
+  UpdateCache(cache_ratio, previous_ratio, num_soa_tracks,
               animation->timepoints(), scales_ctrl, context->scales_cache_);
   Decompress(num_soa_tracks, animation->timepoints(), scales_ctrl,
              animation->scales_values(), context->scales_cache_,
@@ -509,7 +527,10 @@ bool SamplingJob::Run() const {
   const size_t num_soa_interp_tracks = math::Min(output.size(), num_soa_tracks);
 
   // Interpolates soa hot data.
-  Interpolates(clamped_ratio, num_soa_interp_tracks, context->translations_,
+  // The loop boundary frame samples the beginning of the next loop (ratio 0),
+  // hence interpolation is driven with the cache ratio in that case. For every
+  // other ratio the two values are identical.
+  Interpolates(cache_ratio, num_soa_interp_tracks, context->translations_,
                context->rotations_, context->scales_, output);
 
   return true;
@@ -583,20 +604,39 @@ void SamplingJob::Context::Resize(int _max_tracks) {
   assert(buffer.empty());
 }
 
-float SamplingJob::Context::Step(const Animation& _animation, float _ratio) {
-  // The cache is invalidated if animation has changed...
-  if (animation_ != &_animation) {
+float SamplingJob::Context::Step(const Animation& _animation, float _ratio,
+                                 bool _loop) {
+  // The cache is invalidated if the animation has changed. The animation
+  // unique id (rather than its address) is used so that a context cannot be
+  // fooled by an animation address recycled through delete/new. The looping
+  // convention is part of the cached state too: toggling it must not let the
+  // job read keyframes cached for the other boundary convention.
+  if (animation_ != &_animation || loop_ != _loop ||
+      (animation_ != nullptr && animation_->id_ != _animation.id_)) {
     Invalidate();
     animation_ = &_animation;
+    loop_ = _loop;
   }
   const float previous_ratio = ratio_;
   ratio_ = _ratio;
   return previous_ratio;
 }
 
+void SamplingJob::Context::Restart() {
+  // Forces every component cache to seek back to the first keyframes on the
+  // next cache update (a null "next" key is the initialization trigger used
+  // by UpdateCache, which also re-flags all entries as outdated). This is
+  // used to cross a loop boundary without reading keyframes cached for the
+  // end of the previous loop.
+  translations_cache_.next = 0;
+  rotations_cache_.next = 0;
+  scales_cache_.next = 0;
+}
+
 void SamplingJob::Context::Invalidate() {
   animation_ = nullptr;
   ratio_ = 0.f;
+  loop_ = false;
   translations_cache_.next = 0;
   rotations_cache_.next = 0;
   scales_cache_.next = 0;

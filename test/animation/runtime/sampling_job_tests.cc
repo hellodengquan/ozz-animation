@@ -656,3 +656,233 @@ TEST(CacheResize, SamplingJob) {
   context.Resize(1);
   EXPECT_FALSE(job.Validate());
 }
+
+namespace {
+// Builds a 1s one-track animation with different first (0) and last (10)
+// translation keyframes, so a loop wrap would expose a jump if the boundary
+// frame sampled the end of the clip instead of its beginning.
+ozz::unique_ptr<Animation> BuildLoopBoundaryAnimation(float _last_x) {
+  RawAnimation raw_animation;
+  raw_animation.duration = 1.f;
+  raw_animation.tracks.resize(1);
+  raw_animation.tracks[0].translations.push_back(
+      {0.f, ozz::math::Float3(0.f, 0.f, 0.f)});
+  raw_animation.tracks[0].translations.push_back(
+      {0.5f, ozz::math::Float3(5.f, 0.f, 0.f)});
+  raw_animation.tracks[0].translations.push_back(
+      {1.f, ozz::math::Float3(_last_x, 0.f, 0.f)});
+
+  AnimationBuilder builder;
+  return builder(raw_animation);
+}
+}  // namespace
+
+TEST(LoopBoundaryDefaultsToClamping, SamplingJob) {
+  ozz::unique_ptr<Animation> animation = BuildLoopBoundaryAnimation(10.f);
+  ASSERT_TRUE(animation);
+
+  SamplingJob::Context context(4);
+  ozz::math::SoaTransform output[1];
+
+  SamplingJob job;
+  job.animation = animation.get();
+  job.context = &context;
+  job.output = output;
+
+  // loop defaults to false: the historical clamping behavior is preserved.
+  job.ratio = 1.f;
+  EXPECT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 10.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+
+  // Out of bounds inputs are clamped, including when loop is enabled.
+  job.loop = true;
+  job.ratio = 1.5f;
+  EXPECT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+  job.ratio = -.5f;
+  EXPECT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+}
+
+TEST(LoopBoundaryContinuity, SamplingJob) {
+  ozz::unique_ptr<Animation> animation = BuildLoopBoundaryAnimation(10.f);
+  ASSERT_TRUE(animation);
+
+  SamplingJob::Context context(4);
+  ozz::math::SoaTransform output[1];
+
+  SamplingJob job;
+  job.animation = animation.get();
+  job.context = &context;
+  job.loop = true;
+  job.output = output;
+
+  // Plays forward through the loop boundary.
+  job.ratio = .99f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 9.9f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+  const ozz::math::SoaTransform before_boundary = output[0];
+
+  // The frame that reaches the end of the clip samples the beginning of the
+  // next loop, not the last keyframe posture.
+  job.ratio = 1.f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+  const ozz::math::SoaTransform boundary = output[0];
+
+  // The next frame starts the next loop and continues from the same posture.
+  job.ratio = .01f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, .1f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+
+  // Boundary frame is exactly the posture sampled at ratio 0.
+  job.ratio = 0.f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_EQ(memcmp(&boundary, &output[0], sizeof(boundary)), 0);
+
+  // Standard interpolation semantics still apply inside the clip.
+  EXPECT_NE(memcmp(&before_boundary, &boundary, sizeof(boundary)), 0);
+}
+
+TEST(LoopBoundaryReproducibility, SamplingJob) {
+  ozz::unique_ptr<Animation> animation = BuildLoopBoundaryAnimation(10.f);
+  ASSERT_TRUE(animation);
+
+  ozz::math::SoaTransform reference[1];
+  {
+    // A fresh context must provide the same boundary result as a primed one.
+    SamplingJob::Context fresh_context(4);
+    SamplingJob job;
+    job.animation = animation.get();
+    job.context = &fresh_context;
+    job.loop = true;
+    job.ratio = 1.f;
+    job.output = reference;
+    ASSERT_TRUE(job.Run());
+    EXPECT_SOAFLOAT3_EQ_EST(reference[0].translation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                            0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+  }
+
+  // Primes another context by playing forward to the end of the clip.
+  SamplingJob::Context primed_context(4);
+  ozz::math::SoaTransform primed[1];
+  SamplingJob job;
+  job.animation = animation.get();
+  job.context = &primed_context;
+  job.loop = true;
+  job.output = primed;
+  for (float ratio = 0.f; ratio <= 1.f; ratio += .07f) {
+    job.ratio = ratio;
+    ASSERT_TRUE(job.Run());
+  }
+  job.ratio = 1.f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_EQ(memcmp(reference, primed, sizeof(reference)), 0);
+
+  // Sampling the same (loop, ratio) pair again stays identical.
+  ozz::math::SoaTransform again[1];
+  job.output = again;
+  ASSERT_TRUE(job.Run());
+  EXPECT_EQ(memcmp(reference, again, sizeof(reference)), 0);
+}
+
+TEST(LoopBoundaryContextIsolation, SamplingJob) {
+  ozz::unique_ptr<Animation> first = BuildLoopBoundaryAnimation(10.f);
+  ozz::unique_ptr<Animation> second = BuildLoopBoundaryAnimation(20.f);
+  ASSERT_TRUE(first);
+  ASSERT_TRUE(second);
+  EXPECT_NE(first->id(), second->id());
+
+  SamplingJob::Context context(4);
+  ozz::math::SoaTransform output[1];
+
+  SamplingJob job;
+  job.context = &context;
+  job.loop = true;
+  job.output = output;
+
+  job.animation = first.get();
+  job.ratio = 1.f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 0.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+  const ozz::math::SoaTransform first_boundary = output[0];
+
+  // Switches animation: the context must not reuse keyframes cached for the
+  // previous clip.
+  job.animation = second.get();
+  job.ratio = .5f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 5.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+
+  // Back to the first clip, same ratio gives the same reproducible result.
+  job.animation = first.get();
+  job.ratio = 1.f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_EQ(memcmp(&first_boundary, &output[0], sizeof(first_boundary)), 0);
+
+  // Toggles the sampling convention: caches cannot be shared across them.
+  job.loop = false;
+  ASSERT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 10.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+  job.loop = true;
+  ASSERT_TRUE(job.Run());
+  EXPECT_EQ(memcmp(&first_boundary, &output[0], sizeof(first_boundary)), 0);
+}
+
+TEST(LoopBoundaryAddressRecycling, SamplingJob) {
+  SamplingJob::Context context(4);
+  ozz::math::SoaTransform output[1];
+
+  // Builds and destroys an animation, then builds new ones until the
+  // allocator recycles its address. The unique id must still invalidate the
+  // context, so keyframes from the destroyed animation can never be read.
+  ozz::unique_ptr<Animation> initial = BuildLoopBoundaryAnimation(10.f);
+  ASSERT_TRUE(initial);
+  const Animation* const recycled_address = initial.get();
+  const uint64_t initial_id = initial->id();
+
+  SamplingJob job;
+  job.context = &context;
+  job.loop = true;
+  job.ratio = 1.f;
+  job.output = output;
+  job.animation = initial.get();
+  ASSERT_TRUE(job.Run());
+
+  initial.reset();
+
+  // Same sized allocations performed back to back typically reuse the just
+  // released block. A few attempts absorb allocator bookkeeping variations.
+  ozz::unique_ptr<Animation> replacement;
+  for (int attempt = 0; attempt < 16 && !replacement; ++attempt) {
+    ozz::unique_ptr<Animation> candidate = BuildLoopBoundaryAnimation(30.f);
+    if (candidate.get() == recycled_address) {
+      replacement = std::move(candidate);
+    }
+  }
+  if (!replacement) {
+    // The platform allocator chose not to recycle the address: the unique id
+    // guarantee cannot be exercised through address equality here, so the
+    // check is a no-op rather than a failure.
+    return;
+  }
+  ASSERT_EQ(replacement.get(), recycled_address);
+  EXPECT_NE(replacement->id(), initial_id);
+
+  // The address is the same but the animation differs: sampling must rebuild
+  // the cache from the new animation instead of reading stale keyframes.
+  job.animation = replacement.get();
+  job.ratio = .5f;
+  ASSERT_TRUE(job.Run());
+  EXPECT_SOAFLOAT3_EQ_EST(output[0].translation, 5.f, 0.f, 0.f, 0.f, 0.f,
+                          0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f);
+}

@@ -28,6 +28,7 @@
 #include "ozz/animation/offline/raw_animation_utils.h"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <numeric>
 
@@ -111,27 +112,61 @@ typename _Track::value_type::Value SampleComponent(const _Track& _track,
   }
 }
 
+// Wraps _time in [0,_duration[ for cyclic sampling. An exact multiple of the
+// duration maps to the beginning of the next loop (time 0), which is the same
+// convention as the runtime SamplingJob when crossing a loop boundary.
+float WrapLoopTime(float _time, float _duration) {
+  if (_duration <= 0.f) {
+    return 0.f;
+  }
+  float wrapped = std::fmod(_time, _duration);
+  if (wrapped < 0.f) {
+    wrapped += _duration;
+  }
+  // std::fmod returns 0 for an exact multiple of the duration: the boundary
+  // frame therefore samples the beginning of the next loop.
+  return wrapped;
+}
+
 void SampleTrack_NoValidate(const RawAnimation::JointTrack& _track, float _time,
-                            ozz::math::Transform* _transform) {
+                            ozz::math::Transform* _transform, bool _loop,
+                            float _duration) {
+  const float time = _loop ? WrapLoopTime(_time, _duration) : _time;
   _transform->translation =
-      SampleComponent(_track.translations, LerpTranslation, _time);
-  _transform->rotation = SampleComponent(_track.rotations, LerpRotation, _time);
-  _transform->scale = SampleComponent(_track.scales, LerpScale, _time);
+      SampleComponent(_track.translations, LerpTranslation, time);
+  _transform->rotation = SampleComponent(_track.rotations, LerpRotation, time);
+  _transform->scale = SampleComponent(_track.scales, LerpScale, time);
 }
 }  // namespace
 
 bool SampleTrack(const RawAnimation::JointTrack& _track, float _time,
-                 ozz::math::Transform* _transform) {
+                 ozz::math::Transform* _transform, bool _loop) {
   if (!_track.Validate(std::numeric_limits<float>::infinity())) {
     return false;
   }
 
-  SampleTrack_NoValidate(_track, _time, _transform);
+  // A track alone has no knowledge of the animation duration. Its first and
+  // last keyframes define its own [first,last] time range, which is used as
+  // the loop period. Animation-level sampling uses the animation duration
+  // instead.
+  float duration = 0.f;
+  if (_loop && !_track.translations.empty()) {
+    duration = math::Max(duration, _track.translations.back().time);
+  }
+  if (_loop && !_track.rotations.empty()) {
+    duration = math::Max(duration, _track.rotations.back().time);
+  }
+  if (_loop && !_track.scales.empty()) {
+    duration = math::Max(duration, _track.scales.back().time);
+  }
+
+  SampleTrack_NoValidate(_track, _time, _transform, _loop, duration);
   return true;
 }
 
 bool SampleAnimation(const RawAnimation& _animation, float _time,
-                     const span<ozz::math::Transform>& _transforms) {
+                     const span<ozz::math::Transform>& _transforms,
+                     bool _loop) {
   if (!_animation.Validate()) {
     return false;
   }
@@ -142,7 +177,8 @@ bool SampleAnimation(const RawAnimation& _animation, float _time,
   // Samples each track.
   for (size_t i = 0; i < _animation.tracks.size(); ++i) {
     SampleTrack_NoValidate(_animation.tracks[i], _time,
-                           _transforms.begin() + i);
+                           _transforms.begin() + i, _loop,
+                           _animation.duration);
   }
 
   // Fills remaining transforms with identity.
@@ -186,7 +222,8 @@ SampleTrackModelSpace(const RawAnimation& _animation,
     auto model = ozz::math::Float4x4::identity();
     for (size_t h = 0; h < hierarchy.size(); ++h) {
       ozz::math::Transform local;
-      SampleTrack_NoValidate(_animation.tracks[hierarchy[h]], time, &local);
+      SampleTrack_NoValidate(_animation.tracks[hierarchy[h]], time, &local,
+                             false, 0.f);
 
       // Computes model space.
       model = model * math::Float4x4::FromAffine(local);

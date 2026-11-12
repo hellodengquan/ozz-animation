@@ -26,16 +26,24 @@
 //----------------------------------------------------------------------------//
 
 #include "gtest/gtest.h"
+#include "ozz/animation/offline/animation_builder.h"
+#include "ozz/animation/offline/raw_animation.h"
 #include "ozz/animation/offline/raw_skeleton.h"
 #include "ozz/animation/offline/skeleton_builder.h"
+#include "ozz/animation/runtime/animation.h"
 #include "ozz/animation/runtime/local_to_model_job.h"
+#include "ozz/animation/runtime/sampling_job.h"
 #include "ozz/animation/runtime/skeleton.h"
 #include "ozz/base/maths/gtest_math_helper.h"
 #include "ozz/base/maths/soa_transform.h"
 #include "ozz/base/memory/unique_ptr.h"
 
 using ozz::animation::LocalToModelJob;
+using ozz::animation::SamplingJob;
 using ozz::animation::Skeleton;
+using ozz::animation::Animation;
+using ozz::animation::offline::AnimationBuilder;
+using ozz::animation::offline::RawAnimation;
 using ozz::animation::offline::RawSkeleton;
 using ozz::animation::offline::SkeletonBuilder;
 
@@ -1023,5 +1031,62 @@ TEST(Empty, LocalToModel) {
     job.skeleton = &skeleton;
     EXPECT_TRUE(job.Validate());
     EXPECT_TRUE(job.Run());
+  }
+}
+
+TEST(LoopBoundaryModelSpace, LocalToModel) {
+  // A one joint skeleton and an animation whose start and end postures
+  // differ, so an incorrect loop boundary would produce a model space jump.
+  RawSkeleton raw_skeleton;
+  raw_skeleton.roots.resize(1);
+  raw_skeleton.roots[0].name = "root";
+  SkeletonBuilder skeleton_builder;
+  ozz::unique_ptr<Skeleton> skeleton(skeleton_builder(raw_skeleton));
+  ASSERT_TRUE(skeleton);
+
+  RawAnimation raw_animation;
+  raw_animation.duration = 1.f;
+  raw_animation.tracks.resize(1);
+  raw_animation.tracks[0].translations.push_back(
+      {0.f, ozz::math::Float3(0.f, 0.f, 0.f)});
+  raw_animation.tracks[0].translations.push_back(
+      {1.f, ozz::math::Float3(10.f, 0.f, 0.f)});
+  AnimationBuilder animation_builder;
+  ozz::unique_ptr<ozz::animation::Animation> animation(
+      animation_builder(raw_animation));
+  ASSERT_TRUE(animation);
+
+  SamplingJob::Context context(4);
+  ozz::math::SoaTransform local[1];
+  ozz::math::Float4x4 boundary_model[1];
+  ozz::math::Float4x4 start_model[1];
+
+  auto to_model = [&](ozz::math::Float4x4* _model) {
+    LocalToModelJob job;
+    job.skeleton = skeleton.get();
+    job.input = local;
+    job.output = ozz::span<ozz::math::Float4x4>(_model, 1);
+    ASSERT_TRUE(job.Run());
+  };
+
+  SamplingJob sampling;
+  sampling.animation = animation.get();
+  sampling.context = &context;
+  sampling.loop = true;
+  sampling.output = local;
+
+  // Boundary frame: end of a loop exposes the beginning of the next one.
+  sampling.ratio = 1.f;
+  ASSERT_TRUE(sampling.Run());
+  to_model(boundary_model);
+
+  // First frame of the next loop produces the same model space matrix.
+  sampling.ratio = 0.f;
+  ASSERT_TRUE(sampling.Run());
+  to_model(start_model);
+
+  for (int i = 0; i < 16; ++i) {
+    EXPECT_FLOAT_EQ(reinterpret_cast<const float*>(boundary_model)[i],
+                    reinterpret_cast<const float*>(start_model)[i]);
   }
 }
